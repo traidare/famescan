@@ -1,0 +1,32 @@
+[project]
+name = "famescan"
+version = "0.1.0"
+description = "Automated FAME area percent reports from Agilent GC/MSD ChemStation .D data"
+readme = "README.md"
+license = "Unlicense"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "rainbow-api>=1.5.3",
+    "scipy>=1.14",
+]
+
+[project.scripts]
+famescan = "famescan.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.13"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
