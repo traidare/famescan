@@ -1,13 +1,13 @@
 import numpy as np
 import pytest
+from fakes import DT, retention_times
 
 from famescan.config import Config
 from famescan.peaks import detect_peaks
 
-DT = 0.679  # s per scan, as in the runs
 N = 600
 SCANS = np.arange(N)
-RT = 5.0 + SCANS * DT / 60
+RT = retention_times(N)
 
 
 def gaussian(height: float, apex: float, sigma: float) -> np.ndarray:
@@ -77,17 +77,16 @@ def test_saturated_peaks():
     tic = np.concatenate(
         [7.3e5 + rng.normal(0, 1.5e4, pad), SATURATED, 1.0e6 + rng.normal(0, 1.5e4, pad)]
     )
-    rt = 5.0 + np.arange(len(tic)) * DT / 60
-    peaks = detect_peaks(tic, rt, Config())
+    peaks = detect_peaks(tic, retention_times(len(tic)), Config())
 
     def scan(i: int) -> int:  # report scan number in the original run
         return i - pad + 1690
 
     assert not {1771, 1795} & {scan(p.apex) for p in peaks}  # spikes are no peaks
     c181, c180 = (p for p in peaks if p.height > 1e7)  # flat tops are not split
-    # The manual integration of the reference report: 1700 1744 1776 rM 1266155539
+    # expected C18:1 peak: scans 1700 1744 1776, area 1266155539
     assert (scan(c181.first), scan(c181.apex), scan(c181.last)) == (1700, 1744, 1776)
     assert c181.area == pytest.approx(1266155539, rel=0.02)
-    # RTE: 1779 1794 1800 rVB 284085326
+    # expected C18:0 peak: scans 1779 1794 (1800), area 284085326
     assert (scan(c180.first), scan(c180.apex)) == (1779, 1794)
     assert c180.area == pytest.approx(284085326, rel=0.03)

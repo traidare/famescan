@@ -1,14 +1,12 @@
-from pathlib import Path
-
 import numpy as np
 import pytest
+from fakes import MZ, make_run
 
-from famescan.config import Config
-from famescan.fames import _anchors, _coelutes, _ecl, fame_table, identify
+from famescan.config import Config, FameClass
+from famescan.fames import _anchors, _coelutes, _ecl, check_config, fame_table, identify
 from famescan.io import Run
 from famescan.peaks import Peak, integrate
 
-MZ = np.arange(40, 551)
 N = 41
 APEX = 20
 
@@ -56,12 +54,11 @@ def run_with(*components: tuple[dict[int, float], float, int]) -> tuple[Run, Pea
     for ions, height, apex in components:
         profile = np.exp(-0.5 * ((scans - apex) / 3.0) ** 2)
         intensity += height * np.outer(profile, spectrum(ions) / 100)
-    rt = 20.0 + scans * 0.679 / 60
-    run = Run(Path("X.D"), rt, MZ, intensity, intensity.sum(axis=1), "", "", "", 1)
+    run = make_run(intensity)
     peak = Peak(
         APEX - 12, APEX, APEX + 12, base_first=run.tic[APEX - 12], base_last=run.tic[APEX + 12]
     )
-    integrate(peak, run.tic, rt * 60)
+    integrate(peak, run.tic, run.rt * 60)
     return run, peak
 
 
@@ -75,23 +72,23 @@ def test_fames_are_identified(ions, label):
     assert ident.m_plus_rel == pytest.approx(ions[ident.fame.m_plus], rel=0.05)
 
 
-def test_alkane_with_fame_mass_is_rejected():
-    ident = identify(*run_with((HEPTADECANE, 1e6, APEX)), Config())
+@pytest.mark.parametrize(
+    ("ions", "candidate", "reason"),
+    [
+        (HEPTADECANE, "C14:1", "M+ 240 C14:1? main ions low: 55:20% 69:0% 83:0% 97:0% 74:0%"),
+        (ETHYL_OLEATE, "C19:1", "M+ 310 C19:1? ethyl ester: 88:68% (74:34%) 101:46% (87:26%)"),
+        (SILOXANE, None, "no co-eluting ion >= m/z 150"),
+        # a compound whose molecular ion lies above the apparent FAME M+
+        ({**METHYL_PALMITATE, 288: 6.0}, None, "highest ion m/z 288 is no FAME M+"),
+        # M+1 stronger than half of M+: 271 is not the isotope of 270
+        ({**METHYL_PALMITATE, 271: 6.0}, None, "highest ion m/z 271 is no FAME M+"),
+    ],
+)
+def test_rejected(ions, candidate, reason):
+    ident = identify(*run_with((ions, 1e6, APEX)), Config())
     assert ident.fame is None
-    assert ident.candidate is not None and ident.candidate.label == "C14:1"
-    assert ident.reason.startswith("M+ 240 C14:1? main ions low")
-
-
-def test_ethyl_ester_is_rejected():
-    ident = identify(*run_with((ETHYL_OLEATE, 1e6, APEX)), Config())
-    assert ident.fame is None
-    assert ident.candidate is not None and ident.candidate.label == "C19:1"
-    assert ident.reason == "M+ 310 C19:1? ethyl ester: 88:68% (74:34%) 101:46% (87:26%)"
-
-
-def test_siloxane_is_rejected():
-    ident = identify(*run_with((SILOXANE, 1e6, APEX)), Config())
-    assert (ident.fame, ident.candidate, ident.base_mz) == (None, None, 73)
+    assert (ident.candidate.label if ident.candidate else None) == candidate
+    assert ident.reason == reason
 
 
 def test_coeluting_bleed_is_ignored():
@@ -101,28 +98,12 @@ def test_coeluting_bleed_is_ignored():
     assert ident.fame is not None and ident.fame.label == "C16:0", ident.reason
 
 
-def test_ion_above_m_plus_rejects():
-    # a compound whose molecular ion lies above the apparent FAME M+
-    ions = {**METHYL_PALMITATE, 288: 6.0}
-    ident = identify(*run_with((ions, 1e6, APEX)), Config())
-    assert ident.fame is None
-    assert ident.reason == "highest ion m/z 288 is no FAME M+"
-
-
-def test_strong_isotope_is_no_m_plus():
-    # M+1 stronger than half of M+: 271 is not the isotope of 270
-    ions = {**METHYL_PALMITATE, 271: 6.0}
-    ident = identify(*run_with((ions, 1e6, APEX)), Config())
-    assert ident.fame is None
-
-
 def test_coelution():
     # an ion of a compound eluting 6 scans after the apex does not belong to the peak
     other = {57: 100, 300: 20}
     run, peak = run_with((METHYL_PALMITATE, 1e6, APEX), (other, 3e5, APEX + 6))
-    col = {int(m): i for i, m in enumerate(run.mz)}
-    assert _coelutes(run, peak, col[270], 2)
-    assert not _coelutes(run, peak, col[300], 2)
+    assert _coelutes(run, peak, run.column[270], 2)
+    assert not _coelutes(run, peak, run.column[300], 2)
 
 
 def test_fame_table():
@@ -132,8 +113,26 @@ def test_fame_table():
         assert f.m_plus == 14 * f.chain_length + 46 - 2 * f.double_bonds
         assert f.label == f"C{f.chain_length}:{f.double_bonds}"
         assert f.name.endswith("methyl ester")
-    assert [f.label for f in table if f.is_standard] == ["C19:0"]
     assert {f.chain_length for f in table} == set(range(10, 25))
+
+
+def test_custom_fame_table(tmp_path):
+    path = tmp_path / "fames.csv"
+    path.write_text("chain_length,double_bonds,label,m_plus\n16,0,C16:0,270\n18,3,C18:3,292\n")
+    assert [(f.label, f.name) for f in fame_table(str(path))] == [("C16:0", ""), ("C18:3", "")]
+    # the table has no C19:0 standard and a class without rules
+    with pytest.raises(ValueError, match="standard C19:0"):
+        check_config(Config(fame_table=str(path)))
+    with pytest.raises(ValueError, match="no entry for 3 double bond"):
+        check_config(Config(fame_table=str(path), standard=""))
+    classes = Config().classes | {3: FameClass({79: 50.0}, (-1.0, 1.0))}
+    check_config(Config(fame_table=str(path), standard="", classes=classes))
+    with pytest.raises(ValueError, match="C99:0"):
+        check_config(Config(report_fames=("C16:0", "C99:0")))
+
+
+def test_default_config_fits_the_table():
+    check_config(Config())
 
 
 def test_ecl_anchors_ignore_a_stray_identification():

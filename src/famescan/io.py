@@ -4,6 +4,7 @@ import struct
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,20 @@ class Run:
     @property
     def name(self) -> str:
         return self.path.name
+
+    @cached_property
+    def scan_interval(self) -> float:
+        """Median time between scans in seconds."""
+        return scan_interval(self.rt)
+
+    @cached_property
+    def column(self) -> dict[int, int]:
+        """Intensity column of each m/z."""
+        return {int(m): i for i, m in enumerate(self.mz)}
+
+
+def scan_interval(rt_min: np.ndarray) -> float:
+    return float(np.median(np.diff(rt_min))) * 60.0 if len(rt_min) > 1 else 1.0
 
 
 def _pascal_string(raw: bytes, offset: int) -> str:

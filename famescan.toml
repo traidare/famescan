@@ -1,0 +1,57 @@
+# --- peak detection on the TIC (at 0.679 s per scan like ChemStation's
+# "Filtering: 5" and "Peak separation: 5")
+
+# Savitzky-Golay window, for detection and boundaries only; below 3 scans: no
+# smoothing
+smoothing_window_s = 3.4
+# minimum width at half prominence (smoothed TIC); narrower maxima are spikes,
+# such as the single scan a saturated peak can end with
+min_width_s = 0.88
+# closer apexes are merged
+min_separation_s = 3.4
+# minimum peak prominence, in multiples of the TIC noise
+noise_factor = 5.0
+
+# --- FAME identification
+
+# CSV file with the FAMEs to look for (columns chain_length, double_bonds,
+# label, name, m_plus), relative to this file
+fame_table = "src/famescan/data/fame_molecular_ions.csv"
+# ions from this % of the base peak on are significant; M+ must be one of them
+min_ion_pct = 2.0
+
+# --- report
+
+# report only these FAMEs, e.g. ["C16:0", "C18:1"]; empty: all FAMEs of the
+# table
+report_fames = []
+# FAME peaks below this % of the largest FAME peak are dropped
+min_area_pct = 0.1
+# label of the internal standard; its largest peak in a run is marked as the
+# standard; empty: no internal standard
+standard = "C19:0"
+# whether the standard counts in % max and % total; if not, the percentages are
+# relative to the other FAME peaks (the standard's own percentages too)
+standard_in_pct = true
+
+# --- the rules per number of double bonds: every number in the FAME table needs
+# a [classes.N] table. A settings file may change just one of the two rules.
+#
+# main_ions: fragment ions that must be present, m/z = minimum % of the base
+#   peak
+# ecl_window: allowed equivalent chain length minus chain length. These windows
+#   suit columns on which unsaturated FAMEs elute shortly before the saturated
+#   ones; on polar (cyanopropyl) columns they elute after them.
+
+[classes.0]
+main_ions = { 74 = 50.0, 87 = 20.0 }
+ecl_window = [-1.0, 0.5]
+
+[classes.1]
+# 74, the methyl ester ion, separates mono-unsaturated FAMEs from alkenes
+main_ions = { 55 = 25.0, 69 = 25.0, 83 = 25.0, 97 = 25.0, 74 = 15.0 }
+ecl_window = [-1.0, 0.5]
+
+[classes.2]
+main_ions = { 67 = 40.0, 81 = 40.0, 95 = 40.0, 55 = 15.0 }
+ecl_window = [-1.0, 1.0]

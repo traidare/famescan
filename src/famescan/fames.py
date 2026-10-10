@@ -3,12 +3,16 @@
 A peak is a fatty acid methyl ester if
 
 1. the highest significant ion that co-elutes with the peak (ignoring siloxane bleed) is a
-   molecular ion M+ from ``data/fame_molecular_ions.csv`` or one of its isotopes M+1, M+2,
+   molecular ion M+ of the FAME table (``Config.fame_table``, by default
+   ``data/fame_molecular_ions.csv``) or one of its isotopes M+1, M+2,
 2. the main fragment ions of the FAME class implied by M+ are present (saturated: 74/87,
    mono-unsaturated: 55/69/83/97 plus the methyl ester ion 74, di-unsaturated: 67/81/95/55)
    and the ester is a methyl, not an ethyl ester (88/101 instead of 74/87), and
 3. it elutes where a FAME of that chain length can elute: its equivalent chain length (ECL),
    interpolated between the saturated FAMEs found in the same run, is close to its chain length.
+
+The rules of 2 and 3 are per number of double bonds (``Config.classes``), so every number in the
+table needs them.
 """
 
 import csv
@@ -16,15 +20,41 @@ import io
 from dataclasses import dataclass
 from functools import cache
 from importlib.resources import files
+from pathlib import Path
 
 import numpy as np
 
-from .config import Config
+from .config import Config, scans
 from .io import Run
 from .peaks import Peak
 
+SPECTRUM_HALFWIDTH_S = 0.7
+"""The peak spectrum is the mean over the apex +- this duration (at least the apex scan)."""
+BACKGROUND_S = 2.0
+"""At a baseline boundary, the background spectrum is the mean over this duration outside the
+peak (at least the boundary scan)."""
+COELUTION_S = 1.4
+"""An ion co-elutes with a peak if its chromatogram peaks within this distance of the TIC apex or
+in the upper half of the TIC peak."""
+MIN_ION_MZ = 150
+"""Lowest m/z considered when looking for the highest ion."""
+SILOXANE_SERIES = (73, 75, 89, 207, 327, 341)
+"""Polysiloxane ions (column and septum bleed), each the start of a series in steps of 74
+(OSi(CH3)2), e.g. 207, 281, 355, 429. Siloxanes co-eluting with a FAME must not count as its
+highest ion, so series ions are skipped if they are not more abundant than m/z 73 (Si(CH3)3+,
+present in every siloxane spectrum), and so are their +1/+2 isotopes (at most half as abundant as
+the series ion)."""
+ETHYL_ESTER_IONS = {88: 74, 101: 87}
+"""Ethyl ester ions and their methyl ester counterparts: the McLafferty ion (88 instead of 74) and
+[CH2CH2COOR]+ (101 instead of 87). An ethyl ester has the M+ of the methyl ester with one more
+carbon (ethyl oleate = "C19:1"). In a methyl ester, 88 and 101 are weak (88 is the isotope of
+87). A peak is an ethyl ester if each ethyl ester ion reaches ``ETHYL_ESTER_RATIO`` of its
+counterpart and ``MIN_ETHYL_ION_PCT`` of the base peak."""
+ETHYL_ESTER_RATIO = 0.5
+MIN_ETHYL_ION_PCT = 10.0
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, order=True)  # ordered by chain length, then double bonds
 class Fame:
     chain_length: int
     double_bonds: int
@@ -32,7 +62,6 @@ class Fame:
     """e.g. ``C18:1``"""
     name: str
     m_plus: int
-    is_standard: bool
 
 
 @dataclass
@@ -51,29 +80,59 @@ class Identification:
     ecl: float | None = None
     """Equivalent chain length, if the run has enough saturated FAMEs to compute it."""
 
+    def reject(self, why: str) -> "Identification":
+        """Reject the candidate FAME, stating why."""
+        assert self.candidate is not None
+        self.fame = None
+        self.reason = f"M+ {self.candidate.m_plus} {self.candidate.label}? {why}"
+        return self
+
 
 @cache
-def fame_table() -> tuple[Fame, ...]:
-    text = files("famescan").joinpath("data/fame_molecular_ions.csv").read_text(encoding="utf-8")
-    return tuple(
-        Fame(
-            chain_length=int(r["chain_length"]),
-            double_bonds=int(r["double_bonds"]),
-            label=r["label"],
-            name=r["name"],
-            m_plus=int(r["m_plus"]),
-            is_standard=r["is_standard"] == "1",
+def fame_table(path: str = "") -> tuple[Fame, ...]:
+    """The FAMEs of a CSV table; ``""``: the built-in one."""
+    if path:
+        text = Path(path).read_text(encoding="utf-8")
+    else:
+        text = files("famescan").joinpath("data/fame_molecular_ions.csv").read_text("utf-8")
+    try:
+        return tuple(
+            Fame(
+                chain_length=int(r["chain_length"]),
+                double_bonds=int(r["double_bonds"]),
+                label=r["label"],
+                name=r.get("name") or "",
+                m_plus=int(r["m_plus"]),
+            )
+            for r in csv.DictReader(io.StringIO(text))
         )
-        for r in csv.DictReader(io.StringIO(text))
-    )
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"FAME table {path or '(built-in)'}: bad or missing column {e}") from e
 
 
-def peak_spectrum(run: Run, peak: Peak, background_scans: int = 3) -> np.ndarray:
-    """Apex spectrum (mean of apex +-1 scan) minus the background interpolated between the peak
-    boundaries, in % of the base peak. At a baseline boundary the background is the mean of the
-    boundary scan and up to ``background_scans - 1`` scans outside; at a valley it is the valley."""
+def check_config(cfg: Config) -> None:
+    """Raise ``ValueError`` if the settings don't fit the FAME table."""
+    table = fame_table(cfg.fame_table)
+    labels = {f.label for f in table}
+    unknown = sorted(set(cfg.report_fames) - labels)
+    if unknown:
+        raise ValueError(f"unknown FAME label(s): {', '.join(unknown)}")
+    if cfg.standard and cfg.standard not in labels:
+        raise ValueError(f"the standard {cfg.standard} is not in the FAME table")
+    missing = sorted({f.double_bonds for f in table} - set(cfg.classes))
+    if missing:
+        raise ValueError(f"classes has no entry for {', '.join(map(str, missing))} double bond(s)")
+
+
+def peak_spectrum(run: Run, peak: Peak) -> np.ndarray:
+    """Apex spectrum (mean over apex +- ``SPECTRUM_HALFWIDTH_S``) minus the background
+    interpolated between the peak boundaries, in % of the base peak. At a baseline boundary the
+    background is the mean over ``BACKGROUND_S`` from the boundary outwards; at a valley it is the
+    valley scan."""
     ms = run.intensity
-    lo, hi = max(peak.first, peak.apex - 1), min(peak.last, peak.apex + 1)
+    half = scans(SPECTRUM_HALFWIDTH_S, run.scan_interval)
+    background_scans = max(1, scans(BACKGROUND_S, run.scan_interval))
+    lo, hi = max(peak.first, peak.apex - half), min(peak.last, peak.apex + half)
     top = ms[lo : hi + 1].mean(axis=0)
 
     def side(scan: int, kind: str, outward: int) -> np.ndarray:
@@ -102,13 +161,13 @@ def _coelutes(run: Run, peak: Peak, column: int, tolerance: int) -> bool:
     return bool(np.all(run.tic[scans] - peak.baseline(scans) >= 0.5 * peak.height))
 
 
-def _is_bleed(m: int, rel: np.ndarray, col: dict[int, int], series: tuple[int, ...]) -> bool:
-    """Polysiloxane ion or one of its isotopes (see ``Config.siloxane_series``)."""
+def _is_bleed(m: int, rel: np.ndarray, col: dict[int, int]) -> bool:
+    """Polysiloxane ion or one of its isotopes (see ``SILOXANE_SERIES``)."""
 
     def siloxane(x: int) -> bool:
         return (
             x in col
-            and any(x >= s and (x - s) % 74 == 0 for s in series)
+            and any(x >= s and (x - s) % 74 == 0 for s in SILOXANE_SERIES)
             and rel[col[x]] <= rel[col[73]]
         )
 
@@ -119,20 +178,23 @@ def _is_bleed(m: int, rel: np.ndarray, col: dict[int, int], series: tuple[int, .
 
 def identify(run: Run, peak: Peak, cfg: Config) -> Identification:
     rel = peak_spectrum(run, peak)
-    mz = run.mz
-    col = {int(m): i for i, m in enumerate(mz)}
+    mz, col = run.mz, run.column
     base_mz = int(mz[int(np.argmax(rel))])
-    by_mass = {f.m_plus: f for f in fame_table()}
+    by_mass = {f.m_plus: f for f in fame_table(cfg.fame_table)}
+    coelution = scans(COELUTION_S, run.scan_interval)
+
+    def ab(m: int) -> float:
+        """Abundance of m/z ``m`` in % of the base peak."""
+        return float(rel[col[m]])
 
     significant = [
         i
-        for i in np.flatnonzero((rel >= cfg.max_higher_ion_rel) & (mz >= cfg.min_ion_mz))[::-1]
-        if not _is_bleed(int(mz[i]), rel, col, cfg.siloxane_series)
-        and _coelutes(run, peak, i, cfg.coelution_scans)
+        for i in np.flatnonzero((rel >= cfg.min_ion_pct) & (mz >= MIN_ION_MZ))[::-1]
+        if not _is_bleed(int(mz[i]), rel, col) and _coelutes(run, peak, i, coelution)
     ]
     if not significant:
         return Identification(
-            None, None, 0.0, base_mz, None, f"no co-eluting ion >= m/z {cfg.min_ion_mz}"
+            None, None, 0.0, base_mz, None, f"no co-eluting ion >= m/z {MIN_ION_MZ}"
         )
     top = int(mz[significant[0]])
 
@@ -142,39 +204,24 @@ def identify(run: Run, peak: Peak, cfg: Config) -> Identification:
         for m in range(top, top - 3, -1)
         if m in by_mass
         and m in col
-        and rel[col[m]] >= cfg.min_m_plus_rel
-        and all(rel[col[i]] <= 0.5 * rel[col[m]] for i in range(m + 1, top + 1))
+        and ab(m) >= cfg.min_ion_pct
+        and all(ab(i) <= 0.5 * ab(m) for i in range(m + 1, top + 1))
     ]
     if not candidates:
         return Identification(None, None, 0.0, base_mz, top, f"highest ion m/z {top} is no FAME M+")
     fame = candidates[0]
-    m_rel = float(rel[col[fame.m_plus]])
+    ident = Identification(fame, fame, ab(fame.m_plus), base_mz, top)
 
-    missing = [
-        f"{m}:{rel[col[m]]:.0f}%"
-        for m, need in cfg.main_ions[fame.double_bonds].items()
-        if rel[col[m]] < need
-    ]
+    main = cfg.classes[fame.double_bonds].main_ions.items()
+    missing = [f"{m}:{ab(m):.0f}%" for m, need in main if ab(m) < need]
     if missing:
-        return Identification(
-            None,
-            fame,
-            m_rel,
-            base_mz,
-            top,
-            f"M+ {fame.m_plus} {fame.label}? main ions low: {' '.join(missing)}",
-        )
+        return ident.reject(f"main ions low: {' '.join(missing)}")
 
-    ethyl = cfg.ethyl_ester_ions.items()
-    if all(
-        rel[col[e]] >= max(cfg.min_ethyl_ion_rel, cfg.ethyl_ester_ratio * rel[col[m]])
-        for e, m in ethyl
-    ):
-        ions = " ".join(f"{e}:{rel[col[e]]:.0f}% ({m}:{rel[col[m]]:.0f}%)" for e, m in ethyl)
-        return Identification(
-            None, fame, m_rel, base_mz, top, f"M+ {fame.m_plus} {fame.label}? ethyl ester: {ions}"
-        )
-    return Identification(fame, fame, m_rel, base_mz, top)
+    ethyl = ETHYL_ESTER_IONS.items()
+    if all(ab(e) >= max(MIN_ETHYL_ION_PCT, ETHYL_ESTER_RATIO * ab(m)) for e, m in ethyl):
+        ions = " ".join(f"{e}:{ab(e):.0f}% ({m}:{ab(m):.0f}%)" for e, m in ethyl)
+        return ident.reject(f"ethyl ester: {ions}")
+    return ident
 
 
 def identify_run(run: Run, peaks: list[Peak], cfg: Config) -> list[Identification]:
@@ -194,10 +241,9 @@ def identify_run(run: Run, peaks: list[Peak], cfg: Config) -> list[Identificatio
             continue
         i.ecl = _ecl(run.rt[p.apex], anchors)
         if i.fame:
-            lo, hi = cfg.ecl_window[i.fame.double_bonds]
+            lo, hi = cfg.classes[i.fame.double_bonds].ecl_window
             if not lo <= i.ecl - i.fame.chain_length <= hi:
-                i.reason = f"M+ {i.fame.m_plus} {i.fame.label}? elutes at ECL {i.ecl:.1f}"
-                i.fame = None
+                i.reject(f"elutes at ECL {i.ecl:.1f}")
     return ids
 
 

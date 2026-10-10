@@ -1,25 +1,23 @@
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pytest
+from fakes import fake_report
 
 from famescan import __version__
 from famescan.chemstation import parse_reports
 from famescan.config import Config
-from famescan.fames import Identification, fame_table
-from famescan.io import Run
-from famescan.peaks import Peak
 from famescan.report import (
     _pair,
     build_report,
     format_row,
+    profile_rows,
     render,
     report_names,
     write_outputs,
 )
 
-# Rows of ChemStation percent reports of the runs (RTE and hand integrations)
+# Rows of ChemStation percent reports, with different number widths and peak types
 ROWS = [
     (
         (1, 14.146, 797, 800, 805, "rM", 2051839, 5778523, 1.02, 0.434),
@@ -74,39 +72,6 @@ def test_parameter_layout(args, line):
     assert _pair(*args) == line
 
 
-def fake_run(path: Path, n_scans: int = 100) -> Run:
-    rt = 5.0 + np.arange(n_scans) * 0.679 / 60
-    return Run(
-        path=path,
-        rt=rt,
-        mz=np.arange(40, 551),
-        intensity=np.zeros((n_scans, 511)),
-        tic=np.zeros(n_scans),
-        sample="Sample 983",
-        acq_on="13 Aug 2026  14:09",
-        method="TEST.M",
-        als_vial=4,
-    )
-
-
-def fake_report(path: Path, n_peaks: int, labels=None):
-    """A report with ``n_peaks`` FAME peaks (C10:0, C10:1, ...) every 10 scans, the last of them
-    the C19:0 standard."""
-    run = fake_run(path, 10 * n_peaks + 10)
-    table = [f for f in fame_table() if not f.is_standard]
-    standard = next(f for f in fame_table() if f.is_standard)
-    peaks, ids = [], []
-    for k in range(n_peaks):
-        fame = standard if k == n_peaks - 1 else table[k]
-        apex = 10 * k + 5
-        start, end = ("V", "B") if k % 2 else ("B", "V")
-        peaks.append(
-            Peak(apex - 3, apex, apex + 4, start, end, height=1e6 * (k + 1), area=3.3e6 * (k + 1))
-        )
-        ids.append(Identification(fame, fame, 5.0, 74, fame.m_plus))
-    return build_report(run, peaks, ids, Config(), labels)
-
-
 def test_build_report_percentages():
     report = fake_report(Path("/data/X.D"), 4)
     areas = [p.area for p in report.peaks]
@@ -118,19 +83,52 @@ def test_build_report_percentages():
 
 
 def test_build_report_label_filter_and_min_area():
-    report = fake_report(Path("/data/X.D"), 4, labels=frozenset({"C10:0", "C19:0"}))
+    report = fake_report(Path("/data/X.D"), 4, Config(report_fames=("C10:0", "C19:0")))
     assert [p.fame.label for p in report.peaks] == ["C10:0", "C19:0"]
     assert report.peaks[-1].pct_total == pytest.approx(100 * 13.2 / 16.5)
+    assert sorted(report.dropped.values()) == [
+        "C10:1 not in report_fames",
+        "C10:2 not in report_fames",
+    ]
 
     report = fake_report(Path("/data/X.D"), 4)
-    report.peaks[0].peak.area = 1.0  # below 0.1 % of the largest FAME
-    rebuilt = build_report(
-        report.run,
-        [fp.peak for fp in report.peaks],
-        [fp.ident for fp in report.peaks],
-        Config(),
-    )
+    peaks = [fp.peak for fp in report.peaks]
+    peaks[0].area = 1.0  # below 0.1 % of the largest FAME
+    rebuilt = build_report(report.run, peaks, [fp.ident for fp in report.peaks], Config())
     assert len(rebuilt.peaks) == 3
+    assert rebuilt.dropped == {peaks[0]: "C10:0 below min area"}
+
+
+def test_standard_options():
+    # areas 3.3, 6.6, 9.9 and the standard 13.2 (x 1e6)
+    report = fake_report(Path("/data/X.D"), 4, Config(standard_in_pct=False))
+    assert [round(p.pct_max, 2) for p in report.peaks] == [33.33, 66.67, 100.0, 133.33]
+    assert [round(p.pct_total, 2) for p in report.peaks] == [16.67, 33.33, 50.0, 66.67]
+    assert report.peaks[-1].is_standard
+
+    report = fake_report(Path("/data/X.D"), 4, Config(standard=""))
+    assert not any(p.is_standard for p in report.peaks)
+    assert sum(p.pct_total for p in report.peaks) == pytest.approx(100.0)
+
+    # C10:1 as standard: it counts in the percentages, C19:0 is an ordinary FAME
+    report = fake_report(Path("/data/X.D"), 4, Config(standard="C10:1"))
+    assert [p.is_standard for p in report.peaks] == [False, True, False, False]
+
+
+def test_profile_rows():
+    a, b = fake_report(Path("/data/A.D"), 3), fake_report(Path("/data/B.D"), 2)
+    b.peaks[0].ident.fame = a.peaks[1].fame  # B: C10:1 + standard, A: C10:0 + C10:1 + standard
+    columns, rows = profile_rows([a, b])
+    assert columns == ["data_file", "sample", "acq_on", "C10:0", "C10:1", "C19:0 (standard)"]
+    assert rows[0] | {"sample": "", "acq_on": ""} == {
+        "data_file": "A.D",
+        "sample": "",
+        "acq_on": "",
+        "C10:0": "16.667",
+        "C10:1": "33.333",
+        "C19:0 (standard)": "50.000",
+    }
+    assert "C10:0" not in rows[1]
 
 
 def test_render_layout():
@@ -167,11 +165,7 @@ def test_render_parse_roundtrip():
     for n, (got, fp) in enumerate(zip(parsed.peaks, report.peaks, strict=True), 1):
         assert got.number == n
         assert got.rt == pytest.approx(fp.rt, abs=5e-4)
-        assert (got.first, got.max, got.last) == (
-            fp.peak.first + 1,
-            fp.peak.apex + 1,
-            fp.peak.last + 1,
-        )
+        assert (got.first, got.max, got.last) == fp.peak.scan_numbers
         assert (got.type, got.height, got.area) == (fp.peak.type, fp.height, fp.area)
         assert got.pct_max == pytest.approx(fp.pct_max, abs=0.005)
         assert got.pct_total == pytest.approx(fp.pct_total, abs=5e-4)
@@ -187,9 +181,22 @@ def test_report_names_disambiguate():
 def test_write_outputs(tmp_path):
     reports = [fake_report(Path("/data/A.D"), 3), fake_report(Path("/data/B.D"), 6)]
     written = write_outputs(reports, tmp_path / "out")
-    assert [p.name for p in written] == ["A.txt", "B.txt", "percent_reports.txt", "fame_peaks.csv"]
-    combined = parse_reports(written[2].read_bytes().decode("latin-1"))
+    assert [p.name for p in written] == [
+        "fame_peaks.csv",
+        "fame_profiles.csv",
+        "A.txt",
+        "B.txt",
+        "percent_reports.txt",
+    ]
+    combined = parse_reports(written[-1].read_bytes().decode("latin-1"))
     assert [r.data_file for r in combined] == ["A.D", "B.D"]
-    csv_lines = written[3].read_text(encoding="utf-8").splitlines()
+    csv_lines = written[0].read_text(encoding="utf-8").splitlines()
     assert csv_lines[0].startswith("data_file,sample,acq_on,peak,rt_min")
     assert len(csv_lines) == 1 + 3 + 6
+    assert len(written[1].read_text(encoding="utf-8").splitlines()) == 1 + 2
+
+    written = write_outputs(reports, tmp_path / "csv", text_reports=False)
+    assert sorted(p.name for p in (tmp_path / "csv").iterdir()) == [
+        "fame_peaks.csv",
+        "fame_profiles.csv",
+    ]

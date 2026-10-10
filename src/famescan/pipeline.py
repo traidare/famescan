@@ -20,11 +20,9 @@ class Analysis:
     report: FameReport
 
 
-def analyse(
-    path: str | Path, cfg: Config | None = None, labels: frozenset[str] | None = None
-) -> Analysis:
+def analyse(path: str | Path, cfg: Config | None = None) -> Analysis:
     cfg = cfg or Config()
     run = load_run(path)
     peaks = detect_peaks(run.tic, run.rt, cfg)
     ids = identify_run(run, peaks, cfg)
-    return Analysis(run, peaks, ids, build_report(run, peaks, ids, cfg, labels))
+    return Analysis(run, peaks, ids, build_report(run, peaks, ids, cfg))
